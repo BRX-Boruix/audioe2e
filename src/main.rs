@@ -407,12 +407,17 @@ fn run_stream(limit_bytes: usize, target_path: &str, tone: Option<bool>) -> i32 
     0
 }
 
-/// 默认流式写入总量：512 KiB。
+/// 默认流式写入总量：8 MiB。
 ///
-/// 为何选它：48kHz/16bit/立体声 = 192000 B/s，512KiB ≈ 2.7 秒音频。
-/// 足够长到能观察到多轮双缓冲轮转（每块 16KiB，共 32 轮），又不至于让
-/// 测试跑太久。
-const STREAM_TOTAL_BYTES: usize = 512 * 1024;
+/// 早期为 512 KiB（≈2.7 秒）。在 M4 的音量斜坡观测中证明**太短**：
+/// audiod 只搬了 593920 字节（约 3 秒）生产者就写完了，此后混音器进入
+/// live=0 空转，而音量变更按设计发生在"已混音 64 轮"之后 —— 那时已无
+/// 音频，端到端观测什么也证明不了。
+///
+/// 8 MiB ≈ 43 秒音频，足以让音量变更前后各有漫长的稳态供数窗口，
+/// 并且远超 intel-hda 每 4 圈（约 2.7 秒）一次的稳态采样间隔。
+/// 代价是每次运行多花几十秒，相对于它带来的可观测性是值得的。
+const STREAM_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// In the early-disconnect test, how many bytes the short-lived path writes.
 ///
