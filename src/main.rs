@@ -28,6 +28,48 @@ fn pattern(i: usize) -> u8 {
     ((i * 37) ^ (i >> 3)) as u8
 }
 
+/// 两路混音验证用的**方波幅度**（s16）。
+///
+/// 为何不用 `pattern` 做两路混音验证：两路写同一序列时，相加再乘 1/N 会
+/// **恰好还原成原序列** —— 与"只混了一路"（增益 1/1）或"直通"的输出
+/// 完全一样，判据因此失效。
+///
+/// 改用**两个幅度相差 3 倍、符号相反**的直流方波：
+///   stream/0 写 +24576 (+0.75)，stream/1 写 -8192 (-0.25)
+///   相加 = +0.5，经固定增益 1/2 -> +0.25 -> s16 约 8192。
+///
+/// **幅度必须差别明显**：初版取 +16384 与 -16383（仅差 1），二者几乎完全
+/// 相消（和仅为 1/65536），输出近似静音——那既证明不了相加，也与"没数据"
+/// 无法区分。该错误由 audiod 的宿主测试在首次运行时抓出（见 lib.rs 中
+/// test_m2_two_tone_acceptance_matches_end_to_end_scenario 的说明）。
+///
+/// 判据的四种可能结果彼此远离，无歧义：
+///   两路都在   -> +0.25 -> 约 8192
+///   仅 stream/0 -> +0.75 -> 约 24575
+///   仅 stream/1 -> -0.25 -> 约 -8192
+///   都没有     -> 完全没有字节写出
+const MIX_TEST_TONE_HI: i16 = 24576;
+const MIX_TEST_TONE_LO: i16 = -8192;
+
+/// 按本路角色填充一帧立体声方波（s16 小端交错）。
+///
+/// `hi` 为 true 表示"高幅正相"路（stream/0），false 表示"低幅反相"路
+/// （stream/1）。两路都填**左右相同**的值：单声道内容复制到双声道，
+/// 与 audiod 混音核心的 mono->stereo 约定一致。
+fn fill_tone(buf: &mut [u8], hi: bool, frames: usize) {
+    let v: i16 = if hi { MIX_TEST_TONE_HI } else { MIX_TEST_TONE_LO };
+    let le = v.to_le_bytes();
+    let mut f = 0usize;
+    while f < frames {
+        let o = f * 4;
+        buf[o] = le[0];
+        buf[o + 1] = le[1];
+        buf[o + 2] = le[0];
+        buf[o + 3] = le[1];
+        f += 1;
+    }
+}
+
 /// 输出一行到 stdout。
 fn say(s: &[u8]) {
     let _ = write(STDOUT, s);
@@ -79,7 +121,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         run_consumer()
     } else if cmd == b"stream" {
         // A3 直连：写 dsp（保持既有验收基线不变）。
-        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/dsp")
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/dsp", None)
     } else if cmd == b"stream0" {
         // M1 混音链路：写 stream/0，由 audiod 转发到 dsp。
         //
@@ -92,9 +134,22 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 本批次不改 ABI：那是已文档化的契约，改它需同步文档与全部用户程序，
         // 属独立变更（S24 单组件专注）。故用**单 token 表达"模式+目标"**，
         // 各模式用各自确定的字节数常量（STREAM_TOTAL_BYTES），不引入额外参数。
-        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/0")
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/0", Some(true))
+    } else if cmd == b"stream1" {
+        // M2 第二路：写 stream/1，与 stream/0 在 audiod 内相加。
+        // 两路的 pattern 相位相同，但 M2 混音测试程序会写**可区分的**内容，
+        // 使"两路真的都进来了"可从输出反推（见 audioe2e stream2 模式）。
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/1", Some(false))
+    } else if cmd == b"stream1short" {
+        // M2 出口条件「一路断开不影响另一路」的验证用：
+        // stream/1 只写一小段就退出，stream/0 仍持续写。
+        //
+        // 期望观察：stream/1 退出后，audiod 的 live_inputs 从 2 变 1，
+        // 混音输出从 +0.25(8191) 变为 +0.75(24575) —— 增益随**实际参与
+        // 的路数**变化，而 stream/0 的内容本身不受任何影响。
+        run_stream(SHORT_STREAM_BYTES, "/devices/audio/stream/1", Some(false))
     } else {
-        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0)");
+        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0|stream1|stream1short)");
         2
     }
 }
@@ -246,7 +301,7 @@ fn run_consumer() -> i32 {
 ///
 /// 模式 token：`stream`（写 dsp，A3 直连）/ `stream0`（写 stream/0，M1 混音链路）。
 /// 写够即退出——退出即触发 S18 回收槽位，驱动侧会观察到"写者消失"。
-fn run_stream(limit_bytes: usize, target_path: &str) -> i32 {
+fn run_stream(limit_bytes: usize, target_path: &str, tone: Option<bool>) -> i32 {
     // **生产者不 attach**——这是 A2 的架构语义，初版写错在此留档。
     //
     // attach() 是把自己注册为 ring 的**独占消费者**。而本程序是**生产者**：
@@ -297,8 +352,19 @@ fn run_stream(limit_bytes: usize, target_path: &str) -> i32 {
     let mut blocked_rounds = 0u32;
     while written < limit_bytes {
         let want = core::cmp::min(CHUNK, limit_bytes - written);
-        for (i, b) in buf[..want].iter_mut().enumerate() {
-            *b = pattern(written + i);
+        match tone {
+            // 混音验证：写两路幅度不同、符号相反的方波（见 MIX_TEST_TONE_*）。
+            // 必须**帧对齐**（want 是 4 的倍数），否则会写出半帧。
+            Some(hi) => {
+                debug_assert!(want % 4 == 0, "tone chunk must be frame-aligned");
+                fill_tone(&mut buf[..want], hi, want / 4);
+            }
+            // A3 直连：写确定性 pattern，供驱动侧逐字节校验。
+            None => {
+                for (i, b) in buf[..want].iter_mut().enumerate() {
+                    *b = pattern(written + i);
+                }
+            }
         }
         match write(fd, &buf[..want]) {
             Ok(0) => {
@@ -347,3 +413,14 @@ fn run_stream(limit_bytes: usize, target_path: &str) -> i32 {
 /// 足够长到能观察到多轮双缓冲轮转（每块 16KiB，共 32 轮），又不至于让
 /// 测试跑太久。
 const STREAM_TOTAL_BYTES: usize = 512 * 1024;
+
+/// In the early-disconnect test, how many bytes the short-lived path writes.
+///
+/// Sized to span SEVERAL of audiod progress-report intervals (every 64 rounds,
+/// each round moving up to 4 KiB per path). 64 KiB drained before the first
+/// report appeared, so the log showed only live_inputs=1 and the TRANSITION
+/// from 2 to 1 -- the thing the test exists to observe -- was never captured.
+/// 2 MiB keeps the short path alive for many reports, so the log contains both
+/// live_inputs=2 (while it runs) and live_inputs=1 (after it exits), which is
+/// what actually demonstrates "one path disconnecting does not disturb the other".
+const SHORT_STREAM_BYTES: usize = 2 * 1024 * 1024;
