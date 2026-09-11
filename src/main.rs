@@ -17,7 +17,7 @@
 #![no_std]
 #![no_main]
 
-use libsys::{Error, OpenFlags, Permissions, STDOUT, audio, open, write, yield_now};
+use libsys::{Error, OpenFlags, Permissions, STDOUT, audio, close, open, write, yield_now};
 
 /// 测试用 PCM 帧长度（字节）。
 const FRAME_BYTES: usize = 256;
@@ -121,7 +121,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         run_consumer()
     } else if cmd == b"stream" {
         // A3 直连：写 dsp（保持既有验收基线不变）。
-        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/dsp", None)
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/dsp", None, None)
     } else if cmd == b"stream0" {
         // M1 混音链路：写 stream/0，由 audiod 转发到 dsp。
         //
@@ -134,12 +134,20 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 本批次不改 ABI：那是已文档化的契约，改它需同步文档与全部用户程序，
         // 属独立变更（S24 单组件专注）。故用**单 token 表达"模式+目标"**，
         // 各模式用各自确定的字节数常量（STREAM_TOTAL_BYTES），不引入额外参数。
-        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/0", Some(true))
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/0", Some(true), None)
     } else if cmd == b"stream1" {
         // M2 第二路：写 stream/1，与 stream/0 在 audiod 内相加。
         // 两路的 pattern 相位相同，但 M2 混音测试程序会写**可区分的**内容，
         // 使"两路真的都进来了"可从输出反推（见 audioe2e stream2 模式）。
-        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/1", Some(false))
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/1", Some(false), None)
+    } else if cmd == b"stream0_44k" {
+        // 批次五 M5：以 **44.1kHz** 声明并写入 stream/0，验证 audiod 会按
+        // rate 属性把它重采样到 48kHz。
+        //
+        // 为何用它作端到端验证：若重采样没生效（或 audiod 误以为源是 48k），
+        // 输出会**变快约 8.8%** 且时间轴缩短；若生效，输出时长与 48k 源一致。
+        // 这是可以从落盘 WAV 的**长度**直接判定的差异，不依赖听感。
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/1", Some(false), Some(44_100))
     } else if cmd == b"stream1short" {
         // M2 出口条件「一路断开不影响另一路」的验证用：
         // stream/1 只写一小段就退出，stream/0 仍持续写。
@@ -147,9 +155,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 期望观察：stream/1 退出后，audiod 的 live_inputs 从 2 变 1，
         // 混音输出从 +0.25(8191) 变为 +0.75(24575) —— 增益随**实际参与
         // 的路数**变化，而 stream/0 的内容本身不受任何影响。
-        run_stream(SHORT_STREAM_BYTES, "/devices/audio/stream/1", Some(false))
+        run_stream(SHORT_STREAM_BYTES, "/devices/audio/stream/1", Some(false), None)
     } else {
-        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0|stream1|stream1short)");
+        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0|stream0_44k|stream1|stream1short)");
         2
     }
 }
@@ -300,8 +308,69 @@ fn run_consumer() -> i32 {
 /// 不会"碰巧对上"。
 ///
 /// 模式 token：`stream`（写 dsp，A3 直连）/ `stream0`（写 stream/0，M1 混音链路）。
+
+/// 声明某一路流的采样率（写它的 `rate` 属性）。
+///
+/// 写的是**属性文件**，不是音频数据：内核据此记录该流的真实速率，
+/// audiod 读同一条属性来决定如何重采样。两者读的是同一个事实，
+/// 故不存在「生产者和混音器对速率的理解不一致」这种可能。
+///
+/// 失败如实返回错误，不静默继续：一个速率声明失败却照样写 PCM 的生产者，
+/// 会让整条链路按错误速度播放且无人察觉（S20）。
+///
+/// `stream_path` 是流本身的路径（如 `/devices/audio/stream/0`），
+/// 本函数在其后拼 `/rate`。用定长缓冲拼接，不引入分配器。
+fn set_stream_rate(stream_path: &str, rate_hz: u32) -> Result<(), ()> {
+    const PATH_MAX: usize = 64;
+    if stream_path.len() + 6 > PATH_MAX {
+        return Err(());
+    }
+    let mut pbuf = [0u8; PATH_MAX];
+    let n = stream_path.len();
+    pbuf[..n].copy_from_slice(stream_path.as_bytes());
+    pbuf[n..n + 5].copy_from_slice(b"/rate");
+    let path = unsafe { core::str::from_utf8_unchecked(&pbuf[..n + 5]) };
+    // 只写：本函数只声明速率，不读回。
+    let fd = open(path, OpenFlags::WRITE_ONLY, Permissions::read_write()).map_err(|_| ())?;
+    let mut rbuf = [0u8; 8];
+    let len = format_u32(rate_hz, &mut rbuf);
+    let res = write(fd, &rbuf[..len]).map_err(|_| ());
+    let _ = close(fd);
+    res.map(|_| ())
+}
+
+/// 把 `v` 以十进制写入 `buf`，返回写入长度。
+///
+/// 不引入 `alloc`（本 crate 未链接分配器），故手写最小十进制转换。
+/// 只处理无符号十进制，这正是 `rate` 属性需要的全部。
+fn format_u32(v: u32, buf: &mut [u8]) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    // 先逆序生成，再翻转。u32 最多 10 位。
+    let mut tmp = [0u8; 10];
+    let mut n = 0usize;
+    let mut x = v;
+    while x > 0 {
+        tmp[n] = b'0' + (x % 10) as u8;
+        x /= 10;
+        n += 1;
+    }
+    let mut i = 0usize;
+    while i < n {
+        buf[i] = tmp[n - 1 - i];
+        i += 1;
+    }
+    n
+}
 /// 写够即退出——退出即触发 S18 回收槽位，驱动侧会观察到"写者消失"。
-fn run_stream(limit_bytes: usize, target_path: &str, tone: Option<bool>) -> i32 {
+fn run_stream(
+    limit_bytes: usize,
+    target_path: &str,
+    tone: Option<bool>,
+    rate_hz: Option<u32>,
+) -> i32 {
     // **生产者不 attach**——这是 A2 的架构语义，初版写错在此留档。
     //
     // attach() 是把自己注册为 ring 的**独占消费者**。而本程序是**生产者**：
@@ -343,6 +412,19 @@ fn run_stream(limit_bytes: usize, target_path: &str, tone: Option<bool>) -> i32 
         }
     };
     say(b"[audioe2e] producer target opened");
+
+    // 批次五 M5：可选地先把该流的采样率**声明**出来，再写数据。
+    //
+    // 为何必须显式声明而不是"写了就算"：audiod 按 rate 属性重采样。
+    // 若生产者写 44.1k 的样本却不声明，audiod 会按默认 48000 处理，
+    // 结果是**音调升高约 8.8%**（44100/48000 的倒数），而链路上没有任何
+    // 一处会报错。声明与数据一致是生产者的责任，测试也一样。
+    if let Some(rate) = rate_hz {
+        if set_stream_rate(target, rate).is_err() {
+            say(b"[audioe2e] FAIL: could not declare stream sample rate");
+            return 1;
+        }
+    }
 
     // ring 只有 64KiB；写满即 WouldBlock（背压）。故按块写并重试，
     // 这是**真实的流式行为**：生产者必须能被背压挡住。
