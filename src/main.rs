@@ -177,13 +177,14 @@ fn run_consumer() -> i32 {
     // `block_for_event` 既有约定的同构做法。
     //
     // 因此：EAGAIN 必须重试；其它错误才是真失败。
-    let mut n = 0usize;
+    // 初值 0 是**死赋值**（编译期警告指出）：循环里每条成功路径都会先赋 `n`
+    // 再 break，故 0 永远读不到。改用 loop 的 break 值直接给出结果，
+    // 省掉一个可变绑定——少一个可变状态就少一类错。
     let mut attempts = 0u32;
-    loop {
+    let n = loop {
         match audio::fetch(&mut buf) {
             Ok(k) => {
-                n = k;
-                break;
+                break k;
             }
             Err(e) if e == Error::WouldBlock => {
                 // EAGAIN："曾阻塞、请重试"或超时。二者都重试即可——
@@ -202,7 +203,7 @@ fn run_consumer() -> i32 {
                 return 1;
             }
         }
-    }
+    };
     if n != FRAME_BYTES {
         say(b"[audioe2e] FAIL: fetch returned wrong length");
         let _ = audio::detach();
