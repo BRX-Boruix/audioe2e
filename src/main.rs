@@ -78,30 +78,23 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     } else if cmd == b"consumer" {
         run_consumer()
     } else if cmd == b"stream" {
-        // 可选第二参数：总字节数（十进制）。默认 STREAM_TOTAL_BYTES。
-        let limit = if argc >= 2 {
-            let a = unsafe {
-                let p = *argv.add(1);
-                if p.is_null() {
-                    None
-                } else {
-                    let mut len = 0usize;
-                    while *p.add(len) != 0 {
-                        len += 1;
-                    }
-                    Some(core::slice::from_raw_parts(p, len))
-                }
-            };
-            match a {
-                Some(s) => parse_dec(s).unwrap_or(STREAM_TOTAL_BYTES),
-                None => STREAM_TOTAL_BYTES,
-            }
-        } else {
-            STREAM_TOTAL_BYTES
-        };
-        run_stream(limit)
+        // A3 直连：写 dsp（保持既有验收基线不变）。
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/dsp")
+    } else if cmd == b"stream0" {
+        // M1 混音链路：写 stream/0，由 audiod 转发到 dsp。
+        //
+        // **为何是单 token 而非 `stream <n> <target>`**：内核的参数块 ABI
+        // （docs/abi/syscall-abi.md §4）**恒设 argc=1**，整条 cmd 字符串作为
+        // argv[0] 原样交付，不按空格切分（loader/src/lib.rs:844-846）。
+        // 因此多词命令行会整条进入 `cmd`，与 `b"stream"` 精确比较必然不匹配
+        // ——实测正是 `FAIL: unknown mode`。
+        //
+        // 本批次不改 ABI：那是已文档化的契约，改它需同步文档与全部用户程序，
+        // 属独立变更（S24 单组件专注）。故用**单 token 表达"模式+目标"**，
+        // 各模式用各自确定的字节数常量（STREAM_TOTAL_BYTES），不引入额外参数。
+        run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/0")
     } else {
-        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream)");
+        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0)");
         2
     }
 }
@@ -237,22 +230,11 @@ fn run_consumer() -> i32 {
     0
 }
 
-/// 解析十进制字符串；含非数字则返回 None（不猜、不容错到"看起来对"）。
-fn parse_dec(s: &[u8]) -> Option<usize> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut n: usize = 0;
-    for c in s {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        n = n.checked_mul(10)?.checked_add((c - b'0') as usize)?;
-    }
-    Some(n)
-}
-
-
+// `parse_dec` 已删除（批次四 M1）：它唯一的用途是解析此前设想的 `argv[1]`
+// 字节数参数，而内核参数块 ABI 恒设 argc=1、不做空格切分（见 user_main 中
+// `stream0` 分支的说明）。参数取消后它成为**死代码**，编译警告如实指出。
+// 保留一个未被调用的函数违反 S06/S39；如将来需要通用数字参数，
+// 应作为带文档的 ABI 变更重新引入，而非留在这里当"将来可能用"。
 /// 流式写端：持续向 dsp 写入**已知的确定性 PCM**，供 A3 的 WAV 比对验收。
 ///
 /// **为何必须确定性**：A3 的验收判据是"QEMU 落盘的 WAV 与写进去的字节
@@ -262,9 +244,9 @@ fn parse_dec(s: &[u8]) -> Option<usize> {
 /// 填充用 `pattern(i)`（周期 256、含位翻转）：字节序或偏移错位必然暴露，
 /// 不会"碰巧对上"。
 ///
-/// `argv[1]` 可给总字节数（十进制）。默认写 `STREAM_TOTAL_BYTES`。
+/// 模式 token：`stream`（写 dsp，A3 直连）/ `stream0`（写 stream/0，M1 混音链路）。
 /// 写够即退出——退出即触发 S18 回收槽位，驱动侧会观察到"写者消失"。
-fn run_stream(limit_bytes: usize) -> i32 {
+fn run_stream(limit_bytes: usize, target_path: &str) -> i32 {
     // **生产者不 attach**——这是 A2 的架构语义，初版写错在此留档。
     //
     // attach() 是把自己注册为 ring 的**独占消费者**。而本程序是**生产者**：
@@ -276,18 +258,36 @@ fn run_stream(limit_bytes: usize) -> i32 {
     // 干脆没写任何数据 → 驱动侧空转欠载。这不是崩溃，而是**测错了对象**。
     say(b"[audioe2e] stream producer starting (no attach: we are the producer, not the consumer)");
 
-    let path = b"/devices/audio/dsp\0";
+    // **写入目标可指定**（批次四 M1）：
+    //   - 默认 `dsp`  —— A3 的直连路径（生产者直接喂驱动）；
+    //   - `stream0`   —— M1 的混音链路（生产者 -> stream/0 -> audiod -> dsp）。
+    //
+    // 为何要参数化而不是改默认值：A3 的验收证据建立在"直连 dsp"之上，
+    // 直接改掉会让 A3 回归失去对照。两条路径都要保留、都要可复现。
+    // 选择经**显式参数**而非环境探测（S16：自动逻辑必须提供手动覆盖，
+    // 且默认行为要有理由——此处默认保持 dsp 正是为了不破坏 A3 基线）。
+    let target: &str = target_path;
+    // 不用 alloc：本 crate 未链接分配器。目标路径是编译期已知的两个字面量之一，
+    // 直接在定长数组里拼 NUL 结尾即可（open 需要 NUL 终止的字节串）。
+    const TARGET_MAX: usize = 32;
+    if target.len() + 1 > TARGET_MAX {
+        say(b"[audioe2e] FAIL: target path too long (internal invariant)");
+        return 1;
+    }
+    let mut pbuf = [0u8; TARGET_MAX];
+    pbuf[..target.len()].copy_from_slice(target.as_bytes());
     let fd = match open(
-        unsafe { core::str::from_utf8_unchecked(&path[..path.len() - 1]) },
+        unsafe { core::str::from_utf8_unchecked(&pbuf[..target.len()]) },
         O_RDWR,
         Permissions::read_write(),
     ) {
         Ok(f) => f,
         Err(_) => {
-            say(b"[audioe2e] FAIL: open /devices/audio/dsp");
+            say(b"[audioe2e] FAIL: open stream target");
             return 1;
         }
     };
+    say(b"[audioe2e] producer target opened");
 
     // ring 只有 64KiB；写满即 WouldBlock（背压）。故按块写并重试，
     // 这是**真实的流式行为**：生产者必须能被背压挡住。

@@ -1,0 +1,20 @@
+M1: stream0 模式（写 stream/0 走混音链路）+ 删除死代码 parse_dec
+
+【参数传递：不改 ABI，用单 token】
+
+先写 `stream <总字节> <目标>`，实测 `FAIL: unknown mode`。
+查内核代码定位：loader/src/lib.rs:844-846 **恒设 argc=1**，整条 cmd 作为
+argv[0] 原样交付，**不按空格切分**。故多词命令行必然与 `b"stream"` 不匹配。
+
+不改 ABI 的理由：参数块布局是已文档化契约（docs/abi/syscall-abi.md §4），
+改它需同步文档与全部用户程序，属独立变更；本批次目标是混音器，
+不应顺带改 ABI（S24 单组件专注）。改用单 token `stream0`。
+
+  stream   -> 写 dsp      （A3 直连，保持既有基线可复现）
+  stream0  -> 写 stream/0 （M1 混音链路）
+
+两条路径都保留：A3 的验收证据建立在"直连 dsp"上，改掉默认值会让 A3 回归
+失去对照。
+
+顺带删除因此变为死代码的 parse_dec（编译警告如实指出），
+注释留档为何删、将来如何正确重新引入（S06/S39 不留"将来可能用"）。
