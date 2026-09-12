@@ -140,6 +140,13 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 两路的 pattern 相位相同，但 M2 混音测试程序会写**可区分的**内容，
         // 使"两路真的都进来了"可从输出反推（见 audioe2e stream2 模式）。
         run_stream(STREAM_TOTAL_BYTES, "/devices/audio/stream/1", Some(false), None)
+    } else if cmd == b"stream0_sustain" {
+        // M6 长时间稳定性观测：持续供数足够久，使飘移观测能覆盖 30 分钟。
+        run_stream(SUSTAIN_STREAM_BYTES, "/devices/audio/stream/0", Some(true), None)
+    } else if cmd == b"stream1_sustain" {
+        // 同上，但写 stream/1。两路各需一个独立 token —— 内核参数块 ABI 恒 argc=1，
+        // 无法传"路号"作为第二个参数，故用两个 token 表达。
+        run_stream(SUSTAIN_STREAM_BYTES, "/devices/audio/stream/1", Some(false), None)
     } else if cmd == b"stream0_44k" {
         // 批次五 M5：以 **44.1kHz** 声明并写入 stream/0，验证 audiod 会按
         // rate 属性把它重采样到 48kHz。
@@ -157,7 +164,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 的路数**变化，而 stream/0 的内容本身不受任何影响。
         run_stream(SHORT_STREAM_BYTES, "/devices/audio/stream/1", Some(false), None)
     } else {
-        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0|stream0_44k|stream1|stream1short)");
+        say(b"[audioe2e] FAIL: unknown mode (want producer|consumer|stream|stream0|stream0_44k|stream0_sustain|stream1_sustain|stream1|stream1short)");
         2
     }
 }
@@ -500,6 +507,19 @@ fn run_stream(
 /// 并且远超 intel-hda 每 4 圈（约 2.7 秒）一次的稳态采样间隔。
 /// 代价是每次运行多花几十秒，相对于它带来的可观测性是值得的。
 const STREAM_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// 持续模式的写入总量（M6 长时间稳定性观测）。
+///
+/// 计划要求“≥30 分钟无堆积/枯竭”。其他模式只写 8 MiB
+/// 约 43 秒，写完即退出，audiod 随即进入 live=0 空转 ——
+/// 那样根本无法观测到 30 分钟。故单独给出一个
+/// 足够长的量：30 分钟 @ 48kHz 立体声 s16 = 30*60*48000*4
+/// ≈ 345.6 MB，取 360 MiB 留余量。
+///
+/// 不用“无限循环”的原因：程序必须能**自然结束**，
+/// 否则测试就只能靠外部杀进程收尾，而外部杀会让
+/// “程序是否正常运行到尾”这个信息丢失。定量上限保留了它。
+const SUSTAIN_STREAM_BYTES: usize = 360 * 1024 * 1024;
 
 /// In the early-disconnect test, how many bytes the short-lived path writes.
 ///
