@@ -484,7 +484,12 @@ fn run_stream(
             }
         }
         // 周期性汇报进度（证明真的在推进，而非停在某个数字上）。
-        if written % (64 * 1024) < CHUNK {
+        //
+        // 间隔由 64 KiB 提到 1 MiB：本循环不按实时节流，墙上推进远快于音频
+        // 时间，64 KiB 一条会在数秒内刷出上百行（实测 479 行），淹没 shell
+        // 提示符。1 MiB 间隔下每轮默认总量（8 MiB）仅 8 条汇报，仍足以证明
+        // "在推进"，且末尾的 ALL 行给出最终总量。
+        if written % (1024 * 1024) < CHUNK {
             say(b"[audioe2e] stream wrote ");
             say_dec(written);
             say(b" bytes");
