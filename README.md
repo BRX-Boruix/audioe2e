@@ -1,46 +1,34 @@
 # audioe2e
 
-BORUIX 的**端到端验收程序**，验证音频域的**阻塞-唤醒往返**在真实用户态下正确工作。
+BORUIX 的音频端到端验收程序：经真实系统调用完成一次阻塞唤醒的写入与读回。
 
 [English](README.en.md)
 
 ## 测什么
 
-程序分两个角色（由启动参数区分），经**真实系统调用**跑完一次完整的音频数据往返：
+以两个进程协作完成一轮往返：
 
-| 角色 | 行为 |
-| --- | --- |
-| `producer` | 附加为消费者，经文件路径写入一帧已知 PCM，退出 |
-| `consumer` | 附加为消费者，**阻塞等待**数据，取回后逐字节校验，然后提交、分离、退出 |
+- 写入端附加音频消费者槽位，写入一帧已知 PCM 后退出
+- 读取端附加同一槽位，阻塞等待数据，取回后逐字节核对，确认消费后释放槽位
 
-写入端填充的是**确定性序列**（跨 0/255 边界、有周期性），因此字节序或偏移出错必然暴露，不是随便
-写点数据就算通过。
-
-另有一项**两路混音**验证：两路分别写入幅度相差 3 倍、符号相反的方波，相加后经固定增益输出，
-预期结果约为 `8192`。
-
-> 用同一个序列做两路混音是**判不出来**的——两路相加再除 2 会恰好还原成原序列，与"只混了一路"
-> 或"直通"的输出完全一样。幅度必须差别明显才能构成有效判据。
-
-## 为什么需要独立程序
-
-内核自检直接调用音频节点与环形缓冲，跑在内核态、用内核自有缓冲，**触及不到**两条关键路径：
-
-1. **系统调用封装本身**——参数打包、错误码翻译、用户缓冲校验；
-2. **真实的阻塞-唤醒往返**——它要求真正的进程上下文切换，只能在有进程上下文的用户态进程里验证。
-
-本程序正是为补这两条而存在。
+它覆盖内核启动期自测触不到的两段路径：音频系统调用封装本身（参数打包、错误码翻译、用户缓冲
+校验），以及要求真实进程上下文切换的阻塞唤醒往返。
 
 ## 用法
 
-由协调端拉起两个角色（`producer` / `consumer`）。退出码即裁决。
+命令行字为 `producer` 或 `consumer`，两端成对运行，通常由 [`selftest`](https://github.com/BRX-Boruix/selftest) 协调：
+
+```
+[audioe2e] producer wrote full frame via VFS path
+[audioe2e] consumer fetched full frame
+[audioe2e] consumer verified payload byte-for-byte
+[audioe2e] PASS: blocked reader woke, verified, committed
+```
 
 ## 退出码
 
-| 退出码 | 含义 |
-| --- | --- |
-| `0` | 全部正确 |
-| 非零 | 如实失败（协调端据此断言，绝不把失败静默成成功） |
+- `0`——该端完成且全部核对通过
+- 非零——失败；附加被拒、写入被拒、等待超限、数据不符各不相同，输出行注明
 
 ## 构建
 
@@ -56,14 +44,14 @@ audioe2e/
 ├── build.rs      # 注入链接脚本
 ├── linker.ld     # 用户态段布局
 └── src/
-    └── main.rs   # 生产端与消费端逻辑
+    └── main.rs   # 写入端与读取端的往返实现
 ```
 
 ## 相关项目
 
-- [`libsys`](https://github.com/BRX-Boruix/libsys) —— 提供音频域系统调用封装
-- [`audiod`](https://github.com/BRX-Boruix/audiod) —— 音频混合守护进程
-- [`audiofile`](https://github.com/BRX-Boruix/audiofile) —— WAV 播放程序
+- [`audiod`](https://github.com/BRX-Boruix/audiod) —— 音频混音守护进程
+- [`intel-hda`](https://github.com/BRX-Boruix/intel-hda) —— 音频硬件驱动
+- [`selftest`](https://github.com/BRX-Boruix/selftest) —— 协调两端运行的宿主
 
 ## 许可
 

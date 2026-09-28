@@ -1,43 +1,36 @@
 # audioe2e
 
-An **end-to-end acceptance program** for BORUIX, verifying that **blocking wait and wake-up round trips** in the audio domain work from real user space.
+A BORUIX audio end-to-end acceptance test: one blocking write-and-read-back round trip through real system calls.
 
 [简体中文](README.md)
 
 ## What it tests
 
-The program has two roles (selected by startup argument) and runs one complete audio data round trip through **real syscalls**:
+Two processes complete one round trip:
 
-| Role | Behaviour |
-| --- | --- |
-| `producer` | Attaches as a consumer, writes one frame of known PCM through a file path, exits |
-| `consumer` | Attaches as a consumer, **blocks waiting** for data, verifies it byte by byte, then commits, detaches, and exits |
+- The producer attaches an audio consumer slot, writes one frame of known PCM, and exits
+- The consumer attaches the same slot, blocks waiting for the data, verifies it byte for byte, commits the consumption, and releases the slot
 
-The writing side fills a **deterministic sequence** (crossing the 0/255 boundary, with periodicity), so a byte-order or offset error is bound to show up — it is not "write some data and call it a pass".
-
-There is also a **two-stream mixing** check: the two streams write square waves of opposite sign whose amplitudes differ by a factor of three; summed and passed through a fixed gain, the expected result is about `8192`.
-
-> Using the same sequence for both streams would be **undecidable** — summed and halved it reconstructs the original exactly, identical to mixing only one stream or passing it straight through. The amplitudes must differ markedly for the check to mean anything.
-
-## Why a separate program
-
-The in-kernel self-test calls the audio node and ring buffer directly, running in kernel mode with kernel-owned buffers, and **cannot reach** two critical paths:
-
-1. **The syscall wrappers themselves** — argument packing, error code translation, user buffer validation;
-2. **A real blocking round trip** — which requires a genuine process context switch and can only be verified in a user-space process with a process context.
-
-This program exists to cover those two.
+It covers two paths kernel boot-time tests cannot reach: the audio syscall wrappers themselves
+(argument packing, error translation, user buffer checks), and the blocking wake round trip that
+requires a real process context switch.
 
 ## Usage
 
-The coordinating side starts both roles (`producer` / `consumer`). The exit code is the verdict.
+The command word is `producer` or `consumer`; the two run as a pair, normally coordinated by
+[`selftest`](https://github.com/BRX-Boruix/selftest):
+
+```
+[audioe2e] producer wrote full frame via VFS path
+[audioe2e] consumer fetched full frame
+[audioe2e] consumer verified payload byte-for-byte
+[audioe2e] PASS: blocked reader woke, verified, committed
+```
 
 ## Exit codes
 
-| Exit code | Meaning |
-| --- | --- |
-| `0` | Everything correct |
-| Non-zero | An honest failure (the coordinating side asserts on it and never silences a failure into a success) |
+- `0` — this side finished and all checks passed
+- non-zero — failure; attach rejected, write rejected, wait exceeded and data mismatch are distinct, and the output line says which
 
 ## Building
 
@@ -45,22 +38,22 @@ The coordinating side starts both roles (`producer` / `consumer`). The exit code
 cargo build --release
 ```
 
-## Layout
+## Repository layout
 
 ```
 audioe2e/
-├── Cargo.toml    # package definition
+├── Cargo.toml    # package manifest
 ├── build.rs      # injects the linker script
-├── linker.ld     # user-space section layout
+├── linker.ld     # user-space segment layout
 └── src/
-    └── main.rs   # producer and consumer logic
+    └── main.rs   # the producer and consumer round trip
 ```
 
 ## Related projects
 
-- [`libsys`](https://github.com/BRX-Boruix/libsys) — provides the audio-domain syscall wrappers
 - [`audiod`](https://github.com/BRX-Boruix/audiod) — the audio mixing daemon
-- [`audiofile`](https://github.com/BRX-Boruix/audiofile) — the WAV player
+- [`intel-hda`](https://github.com/BRX-Boruix/intel-hda) — the audio hardware driver
+- [`selftest`](https://github.com/BRX-Boruix/selftest) — the host coordinating both sides
 
 ## License
 
